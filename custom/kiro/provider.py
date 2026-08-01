@@ -3,7 +3,7 @@ import os
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Iterator, Optional, Union
+from typing import Any, AsyncIterator, Callable, Iterator, Optional, Union
 
 import httpx
 import litellm
@@ -136,6 +136,75 @@ class KiroProvider(CustomLLM):
                     chunk = _event_to_generic_chunk(event, tool_accum)
                     if chunk:
                         yield chunk
+
+    async def acompletion(
+        self,
+        model: str,
+        messages: list,
+        api_base: str,
+        custom_prompt_dict: dict,
+        model_response: ModelResponse,
+        print_verbose: Callable,
+        encoding: Any,
+        api_key: str,
+        logging_obj: Any,
+        optional_params: dict,
+        acompletion: Any = None,
+        litellm_params: Any = None,
+        logger_fn: Any = None,
+        headers: dict = {},
+        timeout: Optional[Union[float, httpx.Timeout]] = None,
+        client: Optional[Any] = None,
+    ) -> ModelResponse:
+        region = optional_params.get("aws_region_name", self.region)
+        token = _read_token()
+        kiro_model = model.removeprefix("kiro/")
+        payload = build_payload(kiro_model, messages, optional_params.get("tools"))
+        req_headers = build_headers(token, stream=False)
+
+        timeout_val = timeout.connect if isinstance(timeout, httpx.Timeout) else (timeout or 120.0)
+        async with httpx.AsyncClient(timeout=float(timeout_val)) as c:
+            resp = await c.post(_api_url(region), json=payload, headers=req_headers)
+            resp.raise_for_status()
+            events = parse_event_stream(resp.content)
+
+        return _events_to_response(model, events, model_response)
+
+    async def astreaming(
+        self,
+        model: str,
+        messages: list,
+        api_base: str,
+        custom_prompt_dict: dict,
+        model_response: ModelResponse,
+        print_verbose: Callable,
+        encoding: Any,
+        api_key: str,
+        logging_obj: Any,
+        optional_params: dict,
+        acompletion: Any = None,
+        litellm_params: Any = None,
+        logger_fn: Any = None,
+        headers: dict = {},
+        timeout: Optional[Union[float, httpx.Timeout]] = None,
+        client: Optional[Any] = None,
+    ) -> AsyncIterator[Any]:
+        region = optional_params.get("aws_region_name", self.region)
+        token = _read_token()
+        kiro_model = model.removeprefix("kiro/")
+        payload = build_payload(kiro_model, messages, optional_params.get("tools"))
+        req_headers = build_headers(token, stream=True)
+
+        timeout_val = timeout.connect if isinstance(timeout, httpx.Timeout) else (timeout or 120.0)
+        tool_accum: dict[str, Any] = {}
+        async with httpx.AsyncClient(timeout=float(timeout_val)) as c:
+            async with c.stream("POST", _api_url(region), json=payload, headers=req_headers) as resp:
+                resp.raise_for_status()
+                async for chunk_bytes in resp.aiter_bytes():
+                    for event in iter_event_stream(iter([chunk_bytes])):
+                        chunk = _event_to_generic_chunk(event, tool_accum)
+                        if chunk:
+                            yield chunk
 
 
 def _events_to_response(
