@@ -1,6 +1,8 @@
+import json
 import sys
 import time
-from typing import Any, Tuple
+from pathlib import Path
+from typing import Any, Optional, Tuple
 
 import boto3
 
@@ -25,10 +27,49 @@ class DeviceAuthFlow:
         self.refresh_token: str = ""
         self.token_expires_at: float = 0.0
 
+    def load_from_store(self) -> bool:
+        """Load persisted token from disk. Returns True if valid token found."""
+        path = Path(self.config.token_store_path)
+        if not path.exists():
+            return False
+        try:
+            data = json.loads(path.read_text())
+            expires_at = data.get("token_expires_at", 0)
+            if expires_at - time.time() < 300:
+                print("[AWS SSO] Stored token expired or expiring soon, re-login required", file=sys.stderr)
+                return False
+            self.client_id = data.get("client_id", "")
+            self.client_secret = data.get("client_secret", "")
+            self.access_token = data["access_token"]
+            self.refresh_token = data.get("refresh_token", "")
+            self.token_expires_at = expires_at
+            print("[AWS SSO] Loaded valid token from store", file=sys.stderr)
+            return True
+        except Exception as e:
+            print(f"[AWS SSO] Failed to load token store: {e}", file=sys.stderr)
+            return False
+
+    def save_to_store(self) -> None:
+        path = Path(self.config.token_store_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+            "access_token": self.access_token,
+            "refresh_token": self.refresh_token,
+            "token_expires_at": self.token_expires_at,
+        }
+        path.write_text(json.dumps(data, indent=2))
+
     def _register_client(self) -> dict[str, Any]:
         response = self._client.register_client(
-            clientName="litellm-proxy",
+            clientName="kiro-gateway",
             clientType="public",
+            scopes=[
+                "codewhisperer:completions",
+                "codewhisperer:analysis",
+                "codewhisperer:conversations",
+            ],
         )
         self.logger.log("register_client", response)
         self.client_id = response["clientId"]
@@ -89,6 +130,7 @@ class DeviceAuthFlow:
             )
             self.logger.log("refresh_token_success", response)
             self._store_token(response)
+            self.save_to_store()
             return response
         except Exception as e:
             self.logger.log("refresh_token_error", {"error": str(e)})
@@ -112,5 +154,6 @@ class DeviceAuthFlow:
         print(f"\nWaiting for authorization (timeout: {expires_in}s)...\n", file=sys.stderr)
 
         self._poll_for_token(interval, expires_in)
-        print("[AWS SSO] Authorization successful!", file=sys.stderr)
+        self.save_to_store()
+        print("[AWS SSO] Authorization successful! Token saved.", file=sys.stderr)
         return self.access_token, self.token_expires_at

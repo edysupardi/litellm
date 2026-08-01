@@ -22,9 +22,7 @@ def run_prisma_migration() -> None:
 
 
 def run_sso_flow() -> "RefreshDaemon | None":
-    from aws_sso.account_role import AccountRoleDetector
     from aws_sso.config import SSOConfig
-    from aws_sso.credentials import CredentialManager
     from aws_sso.device_auth import DeviceAuthFlow
     from aws_sso.logger import SSOResponseLogger
     from aws_sso.refresh import RefreshDaemon
@@ -36,41 +34,57 @@ def run_sso_flow() -> "RefreshDaemon | None":
     print("[AWS SSO] Initializing...", file=sys.stderr)
     logger = SSOResponseLogger(config.log_dir)
     device_auth = DeviceAuthFlow(config, logger)
-    account_detector = AccountRoleDetector(config, logger)
-    credential_manager = CredentialManager(config, logger)
 
-    device_auth.run_interactive()
+    if not device_auth.load_from_store():
+        device_auth.run_interactive()
 
-    account_id, role_name = account_detector.auto_detect(device_auth.access_token)
-    config.account_id = account_id
-    config.role_name = role_name
+    # Expose token file path so KiroProvider can read it per-request
+    os.environ["KIRO_SSO_TOKEN_FILE"] = config.token_store_path
 
-    credential_manager.fetch(device_auth.access_token, account_id, role_name)
-    credential_manager.inject()
-
-    daemon = RefreshDaemon(config, logger, device_auth, credential_manager)
+    daemon = RefreshDaemon(config, logger, device_auth)
     daemon.start()
-
     return daemon
 
 
-def generate_dynamic_config() -> str:
-    from aws_sso.bedrock_models import fetch_bedrock_models, write_dynamic_config
+def generate_dynamic_config(access_token: str) -> str:
+    import yaml
+    from kiro.provider import fetch_available_models
 
-    region = os.getenv("AWS_BEDROCK_REGION", "us-east-1")
-    master_key = os.getenv("LITELLM_MASTER_KEY", "sk-1234")
+    region = os.environ.get("KIRO_REGION", "us-east-1")
+    master_key = os.environ.get("LITELLM_MASTER_KEY", "sk-1234")
+    models = fetch_available_models(access_token, region)
 
-    models = fetch_bedrock_models(region)
-    write_dynamic_config(models, master_key, DYNAMIC_CONFIG_PATH)
+    model_list = [
+        {
+            "model_name": f"kiro-{m['modelId']}",
+            "litellm_params": {
+                "model": f"kiro/{m['modelId']}",
+            },
+        }
+        for m in models
+    ]
+
+    config = {
+        "model_list": model_list,
+        "general_settings": {"master_key": master_key},
+        "litellm_settings": {"drop_params": True, "telemetry": False},
+    }
+
+    with open(DYNAMIC_CONFIG_PATH, "w") as f:
+        yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
+    print(f"[Kiro] Dynamic config written with {len(model_list)} models", file=sys.stderr)
     return DYNAMIC_CONFIG_PATH
 
 
-def resolve_config_path() -> str:
-    if os.path.isfile(DYNAMIC_CONFIG_PATH):
-        return DYNAMIC_CONFIG_PATH
-    if os.path.isfile(STATIC_CONFIG_PATH):
-        return STATIC_CONFIG_PATH
-    return ""
+def _get_access_token_from_store() -> str:
+    import json
+    token_file = os.environ.get("KIRO_SSO_TOKEN_FILE", "")
+    if not token_file or not os.path.exists(token_file):
+        return ""
+    try:
+        return json.loads(open(token_file).read()).get("access_token", "")
+    except Exception:
+        return ""
 
 
 def build_litellm_cmd(config_path: str) -> list[str]:
@@ -78,7 +92,6 @@ def build_litellm_cmd(config_path: str) -> list[str]:
     if os.getenv("USE_DDTRACE", "").lower() == "true":
         os.environ["DD_TRACE_OPENAI_ENABLED"] = "False"
     args = sys.argv[1:]
-    # inject --config if not already passed by caller
     if config_path and "--config" not in args:
         args = ["--config", config_path] + args
     return base + args
@@ -105,10 +118,17 @@ def main() -> None:
     config_path = STATIC_CONFIG_PATH
     if sso_succeeded:
         try:
-            config_path = generate_dynamic_config()
+            access_token = _get_access_token_from_store()
+            if access_token:
+                config_path = generate_dynamic_config(access_token)
         except Exception as e:
-            print(f"[AWS SSO] Failed to generate dynamic config: {e}, falling back to static config", file=sys.stderr)
-            config_path = resolve_config_path()
+            print(f"[Kiro] Failed to generate dynamic config: {e}, falling back to static config", file=sys.stderr)
+
+    # Register KiroProvider via startup hook
+    os.environ["LITELLM_WORKER_STARTUP_HOOKS"] = "startup_hook:register_kiro_provider"
+    # Make custom/ importable inside the litellm subprocess
+    existing_path = os.environ.get("PYTHONPATH", "")
+    os.environ["PYTHONPATH"] = f"{CUSTOM_DIR}:{existing_path}" if existing_path else CUSTOM_DIR
 
     cmd = build_litellm_cmd(config_path)
     proc = subprocess.Popen(cmd)
