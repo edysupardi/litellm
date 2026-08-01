@@ -4,11 +4,16 @@ services:
       - ./custom:/app/custom:ro
       - ./litellm-config.yaml:/app/config.yaml:ro
       - ./aws-sso-logs:/var/log/aws-sso
+      - kiro_token_store:/var/lib/kiro
     entrypoint: ["python", "/app/custom/entrypoint.py"]
     environment:
       ENABLE_AWS_SSO_OIDC: "${ENABLE_AWS_SSO_OIDC:-false}"
       AWS_SSO_START_URL: "${AWS_SSO_START_URL:-}"
       AWS_SSO_REGION: "${AWS_SSO_REGION:-}"
       AWS_SSO_LOG_DIR: "/var/log/aws-sso"
+      AWS_SSO_TOKEN_FILE: "/var/lib/kiro/sso-token.json"
       AWS_SSO_FAIL_OPEN: "${AWS_SSO_FAIL_OPEN:-false}"
-      AWS_BEDROCK_REGION: "${AWS_BEDROCK_REGION:-us-east-1}"
+      KIRO_REGION: "${KIRO_REGION:-us-east-1}"
+
+volumes:
+  kiro_token_store:
