@@ -9,11 +9,13 @@ if CUSTOM_DIR not in sys.path:
 
 # Register KiroProvider FIRST, before litellm loads any config
 import litellm
+from litellm.utils import custom_llm_setup
 from kiro.provider import KiroProvider
 
 litellm.custom_provider_map = [
     {"provider": "kiro", "custom_handler": KiroProvider()},
 ]
+custom_llm_setup()
 print("[Kiro] Custom provider registered", file=sys.stderr)
 
 
