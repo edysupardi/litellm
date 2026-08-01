@@ -5,6 +5,9 @@ import subprocess
 import sys
 
 CUSTOM_DIR = os.path.dirname(os.path.abspath(__file__))
+DYNAMIC_CONFIG_PATH = "/tmp/litellm-dynamic-config.yaml"
+STATIC_CONFIG_PATH = "/app/config.yaml"
+
 if CUSTOM_DIR not in sys.path:
     sys.path.insert(0, CUSTOM_DIR)
 
@@ -28,7 +31,7 @@ def run_sso_flow() -> "RefreshDaemon | None":
 
     config = SSOConfig.from_env()
     if not config.enabled:
-        return
+        return None
 
     print("[AWS SSO] Initializing...", file=sys.stderr)
     logger = SSOResponseLogger(config.log_dir)
@@ -51,11 +54,34 @@ def run_sso_flow() -> "RefreshDaemon | None":
     return daemon
 
 
-def build_litellm_cmd() -> list[str]:
+def generate_dynamic_config() -> str:
+    from aws_sso.bedrock_models import fetch_bedrock_models, write_dynamic_config
+
+    region = os.getenv("AWS_BEDROCK_REGION", "us-east-1")
+    master_key = os.getenv("LITELLM_MASTER_KEY", "sk-1234")
+
+    models = fetch_bedrock_models(region)
+    write_dynamic_config(models, master_key, DYNAMIC_CONFIG_PATH)
+    return DYNAMIC_CONFIG_PATH
+
+
+def resolve_config_path() -> str:
+    if os.path.isfile(DYNAMIC_CONFIG_PATH):
+        return DYNAMIC_CONFIG_PATH
+    if os.path.isfile(STATIC_CONFIG_PATH):
+        return STATIC_CONFIG_PATH
+    return ""
+
+
+def build_litellm_cmd(config_path: str) -> list[str]:
+    base = ["ddtrace-run", "litellm"] if os.getenv("USE_DDTRACE", "").lower() == "true" else ["litellm"]
     if os.getenv("USE_DDTRACE", "").lower() == "true":
         os.environ["DD_TRACE_OPENAI_ENABLED"] = "False"
-        return ["ddtrace-run", "litellm"] + sys.argv[1:]
-    return ["litellm"] + sys.argv[1:]
+    args = sys.argv[1:]
+    # inject --config if not already passed by caller
+    if config_path and "--config" not in args:
+        args = ["--config", config_path] + args
+    return base + args
 
 
 def main() -> None:
@@ -65,8 +91,10 @@ def main() -> None:
         print(f"Warning: Prisma migration failed: {e}", file=sys.stderr)
 
     daemon = None
+    sso_succeeded = False
     try:
         daemon = run_sso_flow()
+        sso_succeeded = daemon is not None
     except Exception as e:
         print(f"[AWS SSO] Error: {e}", file=sys.stderr)
         if os.getenv("AWS_SSO_FAIL_OPEN", "").lower() != "true":
@@ -74,7 +102,15 @@ def main() -> None:
             sys.exit(1)
         print("[AWS SSO] Continuing without SSO (AWS_SSO_FAIL_OPEN=true)", file=sys.stderr)
 
-    cmd = build_litellm_cmd()
+    config_path = STATIC_CONFIG_PATH
+    if sso_succeeded:
+        try:
+            config_path = generate_dynamic_config()
+        except Exception as e:
+            print(f"[AWS SSO] Failed to generate dynamic config: {e}, falling back to static config", file=sys.stderr)
+            config_path = resolve_config_path()
+
+    cmd = build_litellm_cmd(config_path)
     proc = subprocess.Popen(cmd)
 
     def _forward_signal(signum: int, _frame: object) -> None:
