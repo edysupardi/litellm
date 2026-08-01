@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 import os
-import signal
 import subprocess
 import sys
 
 CUSTOM_DIR = os.path.dirname(os.path.abspath(__file__))
-DYNAMIC_CONFIG_PATH = "/tmp/litellm-dynamic-config.yaml"
-STATIC_CONFIG_PATH = "/app/config.yaml"
-
 if CUSTOM_DIR not in sys.path:
     sys.path.insert(0, CUSTOM_DIR)
+
+# Register KiroProvider FIRST, before litellm loads any config
+import litellm
+from kiro.provider import KiroProvider
+
+litellm.custom_provider_map = [
+    {"provider": "kiro", "custom_handler": KiroProvider()},
+]
+print("[Kiro] Custom provider registered", file=sys.stderr)
 
 
 def run_prisma_migration() -> None:
@@ -38,7 +43,6 @@ def run_sso_flow() -> "RefreshDaemon | None":
     if not device_auth.load_from_store():
         device_auth.run_interactive()
 
-    # Expose token file path so KiroProvider can read it per-request
     os.environ["KIRO_SSO_TOKEN_FILE"] = config.token_store_path
 
     daemon = RefreshDaemon(config, logger, device_auth)
@@ -46,21 +50,26 @@ def run_sso_flow() -> "RefreshDaemon | None":
     return daemon
 
 
-def generate_dynamic_config(access_token: str) -> str:
+def generate_dynamic_config(token_file: str) -> str:
+    import json
     import yaml
     from kiro.provider import fetch_available_models
 
+    dynamic_path = "/tmp/litellm-dynamic-config.yaml"
     region = os.environ.get("KIRO_REGION", "us-east-1")
     master_key = os.environ.get("LITELLM_MASTER_KEY", "sk-1234")
-    models = fetch_available_models(access_token, region)
 
+    try:
+        access_token = json.loads(open(token_file).read()).get("access_token", "")
+    except Exception:
+        access_token = ""
+
+    if not access_token:
+        return "/app/config.yaml"
+
+    models = fetch_available_models(access_token, region)
     model_list = [
-        {
-            "model_name": f"kiro-{m['modelId']}",
-            "litellm_params": {
-                "model": f"kiro/{m['modelId']}",
-            },
-        }
+        {"model_name": f"kiro-{m['modelId']}", "litellm_params": {"model": f"kiro/{m['modelId']}"}}
         for m in models
     ]
 
@@ -69,32 +78,24 @@ def generate_dynamic_config(access_token: str) -> str:
         "general_settings": {"master_key": master_key},
         "litellm_settings": {"drop_params": True, "telemetry": False},
     }
-
-    with open(DYNAMIC_CONFIG_PATH, "w") as f:
+    with open(dynamic_path, "w") as f:
         yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
     print(f"[Kiro] Dynamic config written with {len(model_list)} models", file=sys.stderr)
-    return DYNAMIC_CONFIG_PATH
+    return dynamic_path
 
 
-def _get_access_token_from_store() -> str:
-    import json
-    token_file = os.environ.get("KIRO_SSO_TOKEN_FILE", "")
-    if not token_file or not os.path.exists(token_file):
-        return ""
-    try:
-        return json.loads(open(token_file).read()).get("access_token", "")
-    except Exception:
-        return ""
+def start_proxy(config_path: str) -> None:
+    """Start LiteLLM proxy in this same process so daemon threads stay alive."""
+    # Build sys.argv that proxy_cli expects
+    args = ["litellm", "--config", config_path, "--port", "4000"]
+    # Append any extra args passed to this script (skip script name)
+    for arg in sys.argv[1:]:
+        if arg not in args:
+            args.append(arg)
+    sys.argv = args
 
-
-def build_litellm_cmd(config_path: str) -> list[str]:
-    base = ["ddtrace-run", "litellm"] if os.getenv("USE_DDTRACE", "").lower() == "true" else ["litellm"]
-    if os.getenv("USE_DDTRACE", "").lower() == "true":
-        os.environ["DD_TRACE_OPENAI_ENABLED"] = "False"
-    args = sys.argv[1:]
-    if config_path and "--config" not in args:
-        args = ["--config", config_path] + args
-    return base + args
+    from litellm.proxy.proxy_cli import run_server
+    run_server()
 
 
 def main() -> None:
@@ -103,11 +104,12 @@ def main() -> None:
     except Exception as e:
         print(f"Warning: Prisma migration failed: {e}", file=sys.stderr)
 
-    daemon = None
-    sso_succeeded = False
+    config_path = "/app/config.yaml"
     try:
         daemon = run_sso_flow()
-        sso_succeeded = daemon is not None
+        if daemon is not None:
+            token_file = os.environ.get("KIRO_SSO_TOKEN_FILE", "")
+            config_path = generate_dynamic_config(token_file)
     except Exception as e:
         print(f"[AWS SSO] Error: {e}", file=sys.stderr)
         if os.getenv("AWS_SSO_FAIL_OPEN", "").lower() != "true":
@@ -115,34 +117,7 @@ def main() -> None:
             sys.exit(1)
         print("[AWS SSO] Continuing without SSO (AWS_SSO_FAIL_OPEN=true)", file=sys.stderr)
 
-    config_path = STATIC_CONFIG_PATH
-    if sso_succeeded:
-        try:
-            access_token = _get_access_token_from_store()
-            if access_token:
-                config_path = generate_dynamic_config(access_token)
-        except Exception as e:
-            print(f"[Kiro] Failed to generate dynamic config: {e}, falling back to static config", file=sys.stderr)
-
-    # Register KiroProvider via startup hook
-    os.environ["LITELLM_WORKER_STARTUP_HOOKS"] = "startup_hook:register_kiro_provider"
-    # Make custom/ importable inside the litellm subprocess
-    existing_path = os.environ.get("PYTHONPATH", "")
-    os.environ["PYTHONPATH"] = f"{CUSTOM_DIR}:{existing_path}" if existing_path else CUSTOM_DIR
-
-    cmd = build_litellm_cmd(config_path)
-    proc = subprocess.Popen(cmd)
-
-    def _forward_signal(signum: int, _frame: object) -> None:
-        proc.send_signal(signum)
-
-    signal.signal(signal.SIGTERM, _forward_signal)
-    signal.signal(signal.SIGINT, _forward_signal)
-
-    exit_code = proc.wait()
-    if daemon is not None:
-        daemon.stop()
-    sys.exit(exit_code)
+    start_proxy(config_path)
 
 
 if __name__ == "__main__":
