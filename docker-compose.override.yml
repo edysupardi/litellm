@@ -1,0 +1,14 @@
+services:
+  litellm:
+    volumes:
+      - ./custom:/app/custom:ro
+      - ./litellm-config.yaml:/app/config.yaml:ro
+      - ./aws-sso-logs:/var/log/aws-sso
+    entrypoint: ["python", "/app/custom/entrypoint.py"]
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    environment:
+      ENABLE_AWS_SSO_OIDC: "${ENABLE_AWS_SSO_OIDC:-false}"
+      AWS_SSO_START_URL: "${AWS_SSO_START_URL:-}"
+      AWS_SSO_REGION: "${AWS_SSO_REGION:-}"
+      AWS_SSO_LOG_DIR: "/var/log/aws-sso"
+      AWS_SSO_FAIL_OPEN: "${AWS_SSO_FAIL_OPEN:-false}"
